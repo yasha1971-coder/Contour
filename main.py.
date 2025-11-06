@@ -1,0 +1,55 @@
+import math, random
+
+def sparkline(series, width=60):
+    if not series: return ""
+    tail = series[-width:]
+    mn, mx = min(tail), max(tail)
+    span = mx - mn if mx > mn else 1.0
+    chars = "._-~^*#"
+    out = []
+    for x in tail:
+        idx = int(6 * (x - mn) / span + 1e-9)
+        if idx < 0: idx = 0
+        if idx > 6: idx = 6
+        out.append(chars[idx])
+    return "".join(out)
+
+class ParadoxLive:
+    def __init__(self, freq=1.0, chaos=0.03, k=0.2):
+        self.t = 0.0
+        self.freq = freq
+        self.chaos = chaos
+        self.last = False
+        self.omega = 1.0
+        self.k = k
+
+    def step(self, dt=0.1):
+        self.t += dt
+        s = math.sin(math.pi * self.freq * self.t + random.uniform(-self.chaos, self.chaos))
+        val = (math.tanh(s) > 0)
+        if val == self.last:
+            self.freq *= 1.02
+            val = not val
+        self.omega += self.k * ((1.0 if val != self.last else 0.8) - self.omega)
+        self.last = val
+        return val, self.omega
+
+def run_paradox(steps=24, seed=123):
+    random.seed(seed)
+    P = ParadoxLive()
+    vals, oms = [], []
+    lines = []
+    for i in range(steps):
+        v, om = P.step()
+        vals.append(v); oms.append(om)
+        lines.append(f"t={i+1:02d}  value={str(v):5s}  omega={om:.3f}")
+    lines.append("omega spark: " + sparkline(oms))
+    return "\n".join(lines)
+
+def run_mode(mode='paradox'):
+    if mode == 'paradox':
+        return run_paradox(steps=24, seed=123)
+    else:
+        return "Unknown mode: " + str(mode)
+
+print(run_mode('paradox'))

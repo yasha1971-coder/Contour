@@ -1,125 +1,145 @@
-# main.py  — ACE v0.4e runner + nice summary
-import os, sys, json, re, subprocess, textwrap
-from pathlib import Path
+# main.py — авто-модификатор вокруг ACE v0.4e
 
-ROOT = Path(__file__).parent.resolve()
-REPORT_DIR = ROOT / "ace_v04e_report"
-SUMMARY_TXT = REPORT_DIR / "summary.txt"
-RUN_SUMMARY = ROOT / "run_summary.txt"
-BEST_JSON = ROOT / "best_params.json"
+import json, os, re, sys, subprocess, time
+from copy import deepcopy
 
-ANSI = {
-    "reset":"\x1b[0m","bold":"\x1b[1m",
-    "green":"\x1b[32m","red":"\x1b[31m","yellow":"\x1b[33m","cyan":"\x1b[36m",
-}
+BEST_FILE = "best_params.json"
+REPORT_DIR = "ace_v04e_report"
+SUMMARY = os.path.join(REPORT_DIR, "summary.txt")
 
-def c(color, s): return f"{ANSI[color]}{s}{ANSI['reset']}"
+# --- утилиты --------------------------------------------------------------
 
-def load_best_params():
-    if BEST_JSON.exists():
-        try:
-            with open(BEST_JSON, "r", encoding="utf-8") as f:
-                p = json.load(f)
-            print(c("cyan", f"Using best_params.json: {p}"))
-            return p
-        except Exception as e:
-            print(c("yellow", f"Warning: cannot read best_params.json ({e}). Using script defaults."))
-    else:
-        print(c("yellow", "best_params.json not found — using script defaults."))
-    return {}
+def load_best():
+    with open(BEST_FILE, "r") as f:
+        return json.load(f)
 
-def run_step(title, cmd):
-    print(c("cyan", f"\n— {title}"))
-    subprocess.check_call(cmd, cwd=ROOT)
+def save_params(p):
+    with open(BEST_FILE, "w") as f:
+        json.dump(p, f, indent=2)
 
-def parse_summary(text:str):
-    # robust parser: looks for several possible key names
-    # returns dict with drift, corr, var_win, alive (bool/str)
-    res = {"drift":None, "corr":None, "var_win":None, "alive":None}
-    # unify text
-    t = text.replace("%","").lower()
-    # drift
-    m = re.search(r"(drift(?:_share)?)[^0-9\-+e.]*([\-+0-9.e]+)", t)
-    if m: res["drift"] = float(m.group(2))
-    # corr
-    m = re.search(r"(corr(?:_last|elation)?)[^0-9\-+e.]*([\-+0-9.e]+)", t)
-    if m: res["corr"] = float(m.group(2))
-    # var window for omega
-    m = re.search(r"(var(?:_omega)?(?:_win|_win_last)?)[^0-9\-+e.]*([\-+0-9.e]+)", t)
-    if m: res["var_win"] = float(m.group(2))
-    # alive flag
-    m = re.search(r"(alive(?:_last)?)[^a-z]*(true|false)", t)
-    if m: res["alive"] = (m.group(2) == "true")
-    return res
+def run_kernel_once():
+    # 1) ядро
+    subprocess.check_call([sys.executable, "ace_kernel_v04e.py"])
+    # 2) графики/сводка
+    subprocess.check_call([sys.executable, "xi_chart_v04e.py"])
 
-def pretty_print(metrics:dict):
-    drift = metrics.get("drift")
-    corr  = metrics.get("corr")
-    varw  = metrics.get("var_win")
-    alive = metrics.get("alive")
+def parse_summary():
+    """
+    Ожидаем строки вида:
+      Drift_share: 0.9697
+      Corr_last: 0.0000
+      Var_omega_win: 0.000000e+00
+      Mean_abs_dlambda: 3.2e-03
+      Alive: false/true   (может отсутствовать в старых версиях)
+    Возвращаем словарь метрик с float’ами.
+    """
+    with open(SUMMARY, "r") as f:
+        txt = f.read()
 
-    lines = []
-    lines.append("")
-    lines.append(ANSI["bold"] + "=== ACE v0.4e — run summary ===" + ANSI["reset"])
-    lines.append(f"Drift share : {drift}")
-    lines.append(f"corr(dΩ',dΛ') : {corr}")
-    lines.append(f"var_win(Ω') : {varw}")
-    # verdict (targets: drift≥0.60, corr≥0.25, var_win<1e-3)
-    ok_drift = (drift is not None and drift >= 0.60)
-    ok_corr  = (corr  is not None and corr  >= 0.25)
-    ok_var   = (varw  is not None and varw  < 1e-3)
-    alive_rule = ok_drift and ok_corr and ok_var
+    def find_float(label, default=None):
+        m = re.search(rf"{label}\s*:\s*([-\d\.eE\+]+)", txt)
+        return float(m.group(1)) if m else default
 
-    if alive_rule:
-        verdict = c("green", "ACE ALIVE  ✓")
-    else:
-        verdict = c("red",    "ACE NOT ALIVE  ✗")
-    human_alive = f"(reported alive: {alive})" if isinstance(alive, bool) else "(reported alive: n/a)"
-    lines.append(f"Verdict       : {verdict}  {human_alive}")
+    def find_bool(label, default=None):
+        m = re.search(rf"{label}\s*:\s*(true|false)", txt, flags=re.I)
+        if not m: return default
+        return m.group(1).lower() == "true"
 
-    # guidance
-    tip = []
-    if not ok_drift: tip.append("↑ drift (raise COUP_* a bit)")
-    if not ok_corr:  tip.append("↑ coupling (COUP_OM_TO_LA/COUP_LA_TO_OM) or ↓ HYST")
-    if not ok_var:   tip.append("↓ rigidity (slightly ↑ NOISE or ↓ MEM_DECAY)")
-    if tip:
-        lines.append(c("yellow", "Hints: " + "; ".join(tip)))
+    return {
+        "drift":         find_float("Drift_share", 0.0),
+        "corr":          find_float("Corr_last", 0.0),
+        "var_win":       find_float("Var_omega_win", 0.0),
+        "mean_dlambda":  find_float("Mean_abs_dlambda", 0.0),
+        "alive":         find_bool("Alive", None),
+    }
 
-    block = "\n".join(lines) + "\n"
-    print(block)
-    RUN_SUMMARY.write_text(re.sub("\x1b\\[[0-9;]*m","",block), encoding="utf-8")
-    print(c("cyan", f"Saved: {RUN_SUMMARY.name}"))
+def score(m):
+    # Композитный скор: поощряем высокий drift, ненулевую корреляцию и ненулевую variance
+    drift = m.get("drift", 0.0)
+    corr  = max(0.0, m.get("corr", 0.0))
+    varw  = m.get("var_win", 0.0)
+    # Лёгкий бонус, если варьируется Ω′ (var_win > 0)
+    var_bonus = 0.15 if (varw is not None and varw > 0.0) else 0.0
+    return 0.6*drift + 0.35*corr + var_bonus
 
-def main():
-    _ = load_best_params()  # prints info if exists
+def print_metrics(tag, m):
+    print(f"[{tag}] drift={m['drift']:.4f}  corr={m['corr']:.4f}  var_win={m['var_win']:.3e}  mean|dΛ'|={m['mean_dlambda']:.3e}  alive={m['alive']}")
 
-    # 1) run kernel (creates CSV)
-    run_step("Step 1/2 — run kernel", [sys.executable, "ace_kernel_v04e.py"])
+# --- генерация кандидатных наборов вокруг текущего ------------------------
 
-    # 2) generate charts + summary.txt
-    run_step("Step 2/2 — generate charts", [sys.executable, "xi_chart_v04e.py"])
+def gen_candidates(p0):
+    """
+    Малый локальный поиск вокруг текущего best_params:
+    - немного двигаем коэффициенты связи
+    - ослабляем память и чуть увеличиваем шум (чтобы «раскачать» Ω′)
+    - лёгкий сдвиг гистерезиса
+    """
+    c = []
 
-    # 3) read summary & print big verdict
-    if SUMMARY_TXT.exists():
-        txt = SUMMARY_TXT.read_text(encoding="utf-8", errors="ignore")
-        metrics = parse_summary(txt)
-        pretty_print(metrics)
-        print(c("cyan", f"Report dir: {REPORT_DIR}"))
-    else:
-        print(c("red", "summary.txt not found — check logs / filenames"))
-        # fallback: try to open any summary.txt in repo
-        cand = list(ROOT.glob("**/summary.txt"))
-        if cand:
-            txt = cand[0].read_text(encoding="utf-8", errors="ignore")
-            metrics = parse_summary(txt)
-            pretty_print(metrics)
+    def clamp(x, lo, hi): return max(lo, min(hi, x))
+
+    base = deepcopy(p0)
+    c.append(base)  # текущий как нулевой кандидат
+
+    tweaks = [
+        # усилить связь и уменьшить память, чуть повысить шум
+        {"COUP_LA_TO_OM": +0.02, "COUP_OM_TO_LA": +0.01, "MEM_DECAY": -0.05, "NOISE": +0.0015, "HYST": -0.002},
+        # балансная пара
+        {"COUP_LA_TO_OM": +0.01, "COUP_OM_TO_LA": +0.02, "MEM_DECAY": -0.04, "NOISE": +0.0010, "HYST": +0.000},
+        # мягче связь, но ещё меньше память и больше шум
+        {"COUP_LA_TO_OM": +0.00, "COUP_OM_TO_LA": +0.00, "MEM_DECAY": -0.07, "NOISE": +0.0020, "HYST": +0.002},
+        # чуть сильнее гистерезис чтобы избегать дрожания
+        {"COUP_LA_TO_OM": +0.015,"COUP_OM_TO_LA": +0.015,"MEM_DECAY": -0.03,"NOISE": +0.0010,"HYST": +0.004},
+        # агрессивный вариант для «размораживания»
+        {"COUP_LA_TO_OM": +0.03, "COUP_OM_TO_LA": +0.03, "MEM_DECAY": -0.08, "NOISE": +0.0025, "HYST": -0.002},
+    ]
+
+    for t in tweaks:
+        p = deepcopy(p0)
+        p["COUP_LA_TO_OM"] = clamp(p["COUP_LA_TO_OM"] + t["COUP_LA_TO_OM"], 0.02, 0.20)
+        p["COUP_OM_TO_LA"] = clamp(p["COUP_OM_TO_LA"] + t["COUP_OM_TO_LA"], 0.02, 0.20)
+        p["MEM_DECAY"]     = clamp(p["MEM_DECAY"]     + t["MEM_DECAY"],     0.70, 0.98)
+        p["NOISE"]         = clamp(p["NOISE"]         + t["NOISE"],         0.0005, 0.010)
+        p["HYST"]          = clamp(p["HYST"]          + t["HYST"],          0.008, 0.030)
+        c.append(p)
+    return c
+
+# --- основная процедура ----------------------------------------------------
 
 if __name__ == "__main__":
-    try:
-        main()
-    except subprocess.CalledProcessError as e:
-        print(c("red", f"Subprocess failed: {e}"))
-        sys.exit(1)
-    except Exception as e:
-        print(c("red", f"Error: {e}"))
-        sys.exit(1)
+    print("=== ACE v0.4e — auto-modifier run ===")
+
+    # текущая база
+    base_params = load_best()
+    print("Base params:", base_params)
+
+    candidates = gen_candidates(base_params)
+
+    best_s, best_m, best_p = -1e9, None, None
+
+    for idx, params in enumerate(candidates):
+        print(f"\n--- Candidate #{idx+1}/{len(candidates)} ---")
+        save_params(params)
+        # чистим прошлую сводку, чтобы не перепутать
+        if os.path.exists(SUMMARY):
+            try: os.remove(SUMMARY)
+            except: pass
+
+        run_kernel_once()
+        m = parse_summary()
+        print_metrics("metrics", m)
+        s = score(m)
+        print(f"score = {s:.4f}")
+        if s > best_s:
+            best_s, best_m, best_p = s, m, deepcopy(params)
+
+    # оставляем победителя
+    print("\n=== Best candidate selected ===")
+    print("Best params:", best_p)
+    print_metrics("best", best_m)
+    save_params(best_p)
+
+    # финальный прогон для красивых графиков (уже с лучшими параметрами)
+    print("\nFinal pass to render charts with best params...")
+    run_kernel_once()
+    print("\nDone. See report folder:", REPORT_DIR)

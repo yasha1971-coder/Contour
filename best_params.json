@@ -1,0 +1,7 @@
+{
+  "COUP_LA_TO_OM": 0.10,
+  "COUP_OM_TO_LA": 0.07,
+  "MEM_DECAY": 0.95,
+  "HYST": 0.018,
+  "NOISE": 0.0035
+}

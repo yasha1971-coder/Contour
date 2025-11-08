@@ -1,18 +1,7 @@
 {
-  "COUP_LA_TO_OM": 0.08,
-  "COUP_OM_TO_LA": 0.07,
-  "MEM_DECAY": 0.92,
-  "HYST": 0.016,
-  "NOISE": 0.003,
-
-  "OMEGA_VAR_FLOOR": 1e-12,
-  "VAR_WINDOW": 120,
-
-  "ANTI_STALL_EPS": 1e-8,
-  "ANTI_STALL_BUMP": 0.0025,
-  "ANTI_STALL_COOLDOWN": 60,
-
-  "DRIFT_LOW": 0.64,
-  "DRIFT_HIGH": 0.84,
-  "DRIFT_HYST": 0.02
+  "COUP_LA_TO_OM": 0.11,
+  "COUP_OM_TO_LA": 0.09,
+  "MEM_DECAY": 0.86,
+  "HYST": 0.012,
+  "NOISE": 0.0045
 }

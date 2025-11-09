@@ -1,7 +1,18 @@
 {
-  "COUP_LA_TO_OM": 0.08,   // ↓ ослабляем обратную связь
-  "COUP_OM_TO_LA": 0.20,   // ↑ усиливаем прямую связь для разлочки
-  "MEM_DECAY":     0.45,   // ↓ меньше затухания памяти (больше инерции)
-  "HYST":          0.020,  // ↑ чуть больше гистерезис — против дрожи без локов
-  "NOISE":         0.035   // ↑ стохастика в «рабочий» коридор
+  "COUP_LA_TO_OM": 0.14,
+  "COUP_OM_TO_LA": 0.12,
+  "MEM_DECAY": 0.66,
+  "HYST": 0.012,
+  "NOISE": 0.0088,
+
+  "OMEGA_VAR_FLOOR": 1e-12,
+  "VAR_WINDOW": 340,
+
+  "ANTI_STALL_EPS": 1e-8,
+  "ANTI_STALL_BUMP": 0.0065,
+  "ANTI_STALL_COOLDOWN": 15,
+
+  "DRIFT_LOW": 0.50,
+  "DRIFT_HIGH": 0.95,
+  "DRIFT_HYST": 0.022
 }

@@ -4,7 +4,9 @@
   "MEM_DECAY": 0.35,
   "HYST": 0.006,
   "NOISE": 0.014,
-  "VAR_WINDOW": 240,
+
+  "VAR_WINDOW": 220,
   "DRIFT_HYST": 0.022,
-  "ANTI_STALL_BUMP": 0.009
+  "ANTI_STALL_BUMP": 0.012,
+  "L_GAIN": 1.35
 }

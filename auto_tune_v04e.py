@@ -1,50 +1,56 @@
-import copy, os, csv
-import numpy as np
-from ace_kernel_v04e import ACEngineV04eFix, load_params
+# auto_tune_v04e.py
+import json, itertools
+from ace_kernel_v04e import ACEParams, ACEEngineV04e
+from main import alive_verdict
 
-def composite(m):
-    # цель: поднять drift, не словить нулевую вар, чуть стимулировать корр
-    s = 0.0
-    s += min(m["drift_share"]/0.6, 1.0)
-    s += min(max(m["corr"], 0.0)/0.25, 1.0)
-    s += min(1e-3/max(m["var_win"],1e-10), 2.0)
-    return s
+BASE = {
+    "COUP_LA_TO_OM": 0.18,
+    "COUP_OM_TO_LA": 0.20,
+    "MEM_DECAY":     0.40,
+    "HYST":          0.007,
+    "NOISE":         0.013,
+    "VAR_WINDOW":    300,
+    "DRIFT_HYST":    0.022,
+    "ANTI_STALL_BUMP": 0.012,
+    "L_GAIN":        1.35,
+}
 
-def run_candidate(base, tweaks, steps=6000, seed=42):
-    p = copy.deepcopy(base)
-    p.update(tweaks)
-    eng = ACEngineV04eFix(p, steps=steps, seed=seed)
-    metrics = eng.run()
-    return p, metrics, eng
+def try_params(pdict):
+    eng = ACEEngineV04e(ACEParams(**pdict))
+    m = eng.run(6000)["metrics"]
+    ver, _ = alive_verdict(m)
+    return ver, m
 
-def choose_and_render(base, candidates=6, steps=6000):
-    # вариации вокруг базы
-    grid = [
-        {"COUP_LA_TO_OM": base["COUP_LA_TO_OM"]*x, "COUP_OM_TO_LA": base["COUP_OM_TO_LA"]*y,
-         "MEM_DECAY": base["MEM_DECAY"]+d, "HYST": base["HYST"]+h, "NOISE": base["NOISE"]+n}
-        for x,y,d,h,n in [(0.9,0.8,-0.04,0.0,0.002),
-                          (1.1,1.25,-0.08,-0.002,0.003),
-                          (1.0,1.0,-0.08,0.002,0.003),
-                          (1.2,1.1,-0.04,0.002,0.001),
-                          (0.95,1.2,-0.06,0.000,0.0025),
-                          (1.3,1.3,-0.12,0.000,0.004)]
-    ][:candidates]
-
+def main():
+    grid = {
+        "MEM_DECAY":  [0.38, 0.40, 0.42, 0.44],
+        "NOISE":      [0.012, 0.013, 0.014],
+        "HYST":       [0.0065, 0.007, 0.0075],
+        "L_GAIN":     [1.30, 1.35, 1.40],
+    }
     best = None
-    best_score = -1.0
-    records = []
-    for i,tw in enumerate(grid,1):
-        p, m, _ = run_candidate(base, tw, steps=steps, seed=42+i)
-        s = composite(m)
-        records.append((i, p, m, s))
-        if s > best_score:
-            best_score, best = s, (p,m)
+    for combo in itertools.product(*grid.values()):
+        pd = dict(BASE)
+        for k, v in zip(grid.keys(), combo):
+            pd[k] = v
+        ver, m = try_params(pd)
+        score = (
+            (1 if ver == "ALIVE" else 0),
+            -abs(m["var_win"] - 6.5e-04),
+            m["mean_abs_dla"],
+            m["drift_share"],
+        )
+        if (best is None) or (score > best[0]):
+            best = (score, pd, m, ver)
+        if ver == "ALIVE":
+            break
 
-    return best, records
+    _, pd, m, ver = best
+    print("VERDICT:", ver)
+    print("PARAMS:", pd)
+    print("METRICS:", m)
+    with open("best_params.json", "w", encoding="utf-8") as f:
+        json.dump(pd, f, ensure_ascii=False, indent=2)
 
 if __name__ == "__main__":
-    base = load_params()
-    (best_p, best_m), recs = choose_and_render(base, candidates=6, steps=6000)
-    print("=== Best candidate selected ===")
-    print("Best params:", best_p)
-    print("[best] metrics:", best_m)
+    main()

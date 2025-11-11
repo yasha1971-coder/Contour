@@ -1,0 +1,11 @@
+{
+  "COUP_LA_TO_OM": 0.18,
+  "COUP_OM_TO_LA": 0.20,
+  "MEM_DECAY": 0.40,
+  "HYST": 0.007,
+  "NOISE": 0.013,
+  "VAR_WINDOW": 300,
+  "DRIFT_HYST": 0.022,
+  "ANTI_STALL_BUMP": 0.012,
+  "L_GAIN": 1.35
+}

@@ -1,377 +1,192 @@
 # ace_kernel_v04e.py
-# Autonomous Complexity Engine — v0.4e-fix (self-contained)
-# - симуляция Ω′, Λ′ с куплингом, памятью, шумом и гистерезисом
-# - отчёт с критериями "живости"
-# - авто-подбор параметров (--tune) до VERDICT: [ALIVE]
-#
-# Зависимости: numpy, matplotlib (опционально для графиков)
+# ACE v0.4e-fix — ядро с поддержкой расширенных параметров
+# Публичный интерфейс: ACEEngineV04e(params).run(n_steps)-> dict(metrics, traces)
 
-import os, sys, json, math, csv, time
-from dataclasses import dataclass, asdict
-from typing import Dict, Tuple, List
+from __future__ import annotations
+import math
 import numpy as np
+from dataclasses import dataclass
 
-# ---------------------------
-# Константы и критерии ALIVE
-# ---------------------------
-ALIVE_VAR_MIN = 1e-6
-ALIVE_VAR_MAX = 1e-3
-ALIVE_MEAN_DLDL_MIN = 1e-2
-ALIVE_DRIFT_MIN = 20.0
-STEPS = 6000           # длительность прогона
-DT = 1.0               # шаг "времени"
-OUT_DIR = "ace_v04e_report"
+# ---------- утилиты -----------------------------------------------------------
 
-# ---------------------------
-# Параметры ядра
-# ---------------------------
-DEFAULT_PARAMS = {
-    "COUP_LA_TO_OM": 0.20,
-    "COUP_OM_TO_LA": 0.22,
-    "MEM_DECAY":     0.32,
-    "HYST":          0.007,
-    "NOISE":         0.014,
-    "VAR_WINDOW":    300
-}
+def safe_corrcoef(x: np.ndarray, y: np.ndarray) -> float:
+    """Корреляция в [-1, 1] с защитой от NaN/константности."""
+    if x.size < 2 or y.size < 2:
+        return 0.0
+    sx = np.std(x)
+    sy = np.std(y)
+    if sx == 0 or sy == 0:
+        return 0.0
+    c = float(np.corrcoef(x, y)[0, 1])
+    if math.isnan(c) or math.isinf(c):
+        return 0.0
+    return float(np.clip(c, -1.0, 1.0))
+
+def rolling_var(x: np.ndarray, win: int) -> float:
+    """Вариация на последнем окне (ddof=0) с отсечкой снизу."""
+    if x.size == 0:
+        return 0.0
+    win = int(max(2, min(win, x.size)))
+    w = x[-win:]
+    v = float(np.var(w))
+    return max(v, 1e-12)
+
+# ---------- параметры ---------------------------------------------------------
 
 @dataclass
-class Metrics:
-    drift_share: float
-    lock_share: float
-    iterate_share: float
-    var_win: float
-    mean_abs_dldt: float
-    corr_d_om_d_la: float
-    transitions_per_1k: float
-    bumps_fired: int
-    last_bump_t: int
+class ACEParams:
+    COUP_LA_TO_OM: float = 0.19
+    COUP_OM_TO_LA: float = 0.18
+    MEM_DECAY:     float = 0.35
+    HYST:          float = 0.006
+    NOISE:         float = 0.014
 
-# ---------------------------
-# Вспомогательные функции
-# ---------------------------
+    # новые поля (должны подтягиваться из JSON)
+    VAR_WINDOW:       int   = 300
+    DRIFT_HYST:       float = 0.022
+    ANTI_STALL_BUMP:  float = 0.012
+    L_GAIN:           float = 1.35
 
-def load_params(path="best_params.json") -> Dict[str, float]:
-    params = DEFAULT_PARAMS.copy()
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            params.update(data)
-        except Exception:
-            pass
-    # страховка на VAR_WINDOW (часто пропадал)
-    if "VAR_WINDOW" not in params:
-        params["VAR_WINDOW"] = DEFAULT_PARAMS["VAR_WINDOW"]
-    return params
+# ---------- движок ------------------------------------------------------------
 
-def save_report_text(text: str):
-    os.makedirs(OUT_DIR, exist_ok=True)
-    with open(os.path.join(OUT_DIR, "summary.txt"), "w", encoding="utf-8") as f:
-        f.write(text)
-    with open("last_report.txt", "w", encoding="utf-8") as f:
-        f.write(text)
+class ACEEngineV04e:
+    """
+    Минимальный самодостаточный движок v0.4e:
+    - Две главные величины: Ω′ (omega_p) и Λ′ (lambda_p_raw).
+    - Лямбда проходит через усиление L_GAIN при оценке скорости.
+    - Режимы: LOCK / DRIFT / ITERATE (по порогам на приращениях).
+    - Анти-застойный «пинок» использует ANTI_STALL_BUMP.
+    """
 
-def fmt(x, nd=5):
-    if isinstance(x, (int,)):
-        return str(x)
-    if x == 0:
-        return "0"
-    p = f"{x:.{nd}e}" if (abs(x) < 1e-3 or abs(x) >= 1e3) else f"{x:.{nd}f}"
-    return p
+    def __init__(self, params: ACEParams, rng_seed: int = 42):
+        self.p = params
+        self.rng = np.random.default_rng(rng_seed)
 
-def rolling_var(arr: np.ndarray, win: int) -> np.ndarray:
-    """скользящая дисперсия (population, без ddof)"""
-    if win <= 1:
-        return np.zeros_like(arr)
-    cumsum = np.cumsum(arr)
-    cumsum2 = np.cumsum(arr*arr)
-    var = np.zeros_like(arr)
-    var[:win-1] = np.nan
-    # для каждого окна [i-win+1, i]
-    var[win-1:] = (cumsum2[win-1:] - np.concatenate(([0], cumsum2[:-win])) \
-                  - ( (cumsum[win-1:] - np.concatenate(([0], cumsum[:-win])) )**2 )/win )/win
-    # численно безопасно
-    var = np.clip(var, 0.0, None)
-    return var
+        # состояния
+        self.omega_p = 0.0
+        self.lambda_p = 0.0
 
-def classify_regime(var_win_val: float, mean_abs_dldt_local: float, hyst: float) -> str:
-    # Простая, но практичная логика режимов:
-    # - Lock: очень малая вариативность + почти нет движения Λ′
-    # - Drift: вариативность в "живом" коридоре (наш ALIVE промежуток по var)
-    # - Iterate: всё остальное (более грубые или бурные режимы)
-    if (var_win_val < max(ALIVE_VAR_MIN*0.5, 1e-7)) and (mean_abs_dldt_local < max(ALIVE_MEAN_DLDL_MIN*0.2, 1e-3)):
-        return "Lock"
-    if ALIVE_VAR_MIN <= var_win_val <= ALIVE_VAR_MAX*(1.0 + 2*hyst):
-        return "Drift"
-    return "Iterate"
+        # треки
+        self.t_om = []
+        self.t_la = []
+        self.regimes = []  # 'L','D','I'
 
-# ---------------------------
-# Динамика ACE
-# ---------------------------
+        # служебное
+        self._stall_counter = 0
 
-def run_simulation(params: Dict[str, float], steps: int = STEPS, dt: float = DT) -> Tuple[str, Metrics, Dict[str, np.ndarray]]:
-    np.random.seed(42)  # детерминированность прогона
+    def _step_dynamics(self):
+        """Один шаг динамики Ω′ и Λ′."""
+        p = self.p
 
-    # Распаковка параметров
-    c_la_to_om = float(params["COUP_LA_TO_OM"])
-    c_om_to_la = float(params["COUP_OM_TO_LA"])
-    mem_decay   = float(params["MEM_DECAY"])
-    hyst        = float(params["HYST"])
-    noise_amp   = float(params["NOISE"])
-    win         = int(params.get("VAR_WINDOW", DEFAULT_PARAMS["VAR_WINDOW"]))
+        # Взаимосвязи (простая линейная связка с памятью и шумом)
+        d_om = p.COUP_LA_TO_OM * self.lambda_p - p.MEM_DECAY * self.omega_p
+        d_la = p.COUP_OM_TO_LA * self.omega_p - p.MEM_DECAY * self.lambda_p
 
-    # Состояния
-    Omega = 1.0   # Ω′ (целевой поток ~1)
-    Lambda = 0.95 # Λ′ (ритм)
-    mem = 0.0     # внутренняя "память"
+        # шум для «дыхания»
+        d_om += self.rng.normal(0.0, p.NOISE)
+        d_la += self.rng.normal(0.0, p.NOISE)
 
-    a_om = 0.05  # базовые "жёсткости"
-    a_la = 0.03
+        # обновление
+        self.omega_p += d_om
+        self.lambda_p += d_la
 
-    om = np.zeros(steps)
-    la = np.zeros(steps)
-    d_om = np.zeros(steps)
-    d_la = np.zeros(steps)
-    regime = np.zeros(steps, dtype=int)  # 0=Lock,1=Drift,2=Iterate
+        return d_om, d_la
 
-    var_om_roll = np.zeros(steps)
-    mean_abs_dldt_roll = np.zeros(steps)
+    def _classify_regime(self, d_om: float, d_la: float) -> str:
+        """
+        Классификация режима по «скорости» и гистерезису:
+        - |dΩ′| и |dΛ′| малы → LOCK
+        - средние → DRIFT
+        - большие → ITERATE
+        Границы симметричные, DRIFT_HYST расширяет середину.
+        """
+        p = self.p
+        a = abs(d_om)
+        b = abs(d_la)
+        # базовые пороги
+        lock_th = p.HYST
+        iter_th = lock_th + p.DRIFT_HYST  # всё, что выше — iterate
+        m = max(a, b)
+        if m < lock_th:
+            return 'L'
+        if m > iter_th:
+            return 'I'
+        return 'D'
 
-    # анти-стоп (если "застыли" слишком гладко)
-    bumps_fired = 0
-    last_bump_t = -1
+    def _anti_stall(self, d_om: float, d_la: float):
+        """
+        Если долго «тишина», пихнём систему маленьким импульсом.
+        """
+        p = self.p
+        quiet = (abs(d_om) < p.HYST and abs(d_la) < p.HYST)
+        self._stall_counter = self._stall_counter + 1 if quiet else 0
+        fired = False
+        if self._stall_counter >= 200:  # ~ адаптивная частота
+            bump = p.ANTI_STALL_BUMP
+            self.omega_p += bump * self.rng.choice([-1.0, 1.0])
+            self.lambda_p += bump * self.rng.choice([-1.0, 1.0])
+            self._stall_counter = 0
+            fired = True
+        return fired
 
-    # буфер для скользящей метрики |dΛ′/dt|
-    win_buf = []
+    def run(self, n_steps: int = 6000) -> dict:
+        bumps_fired = 0
+        last_bump_t = -1
 
-    for t in range(steps):
-        # шум
-        n_om = noise_amp * np.random.randn()
-        n_la = noise_amp * np.random.randn()
+        for t in range(n_steps):
+            d_om, d_la = self._step_dynamics()
+            fired = self._anti_stall(d_om, d_la)
+            if fired:
+                bumps_fired += 1
+                last_bump_t = t
 
-        # адаптация памяти
-        # mem стремится к (Ω − Λ), распад со скоростью mem_decay
-        mem += mem_decay * ((Omega - Lambda) - mem) * dt
+            self.t_om.append(self.omega_p)
+            self.t_la.append(self.lambda_p)
+            self.regimes.append(self._classify_regime(d_om, d_la))
 
-        # динамика
-        dOmega = -a_om*(Omega - 1.0) + c_la_to_om*(Lambda - Omega) + n_om
-        dLambda = -a_la*Lambda + c_om_to_la*(Omega - Lambda) + 0.1*mem + n_la
+        om = np.asarray(self.t_om, dtype=float)
+        la = np.asarray(self.t_la, dtype=float)
 
-        Omega += dOmega * dt
-        Lambda += dLambda * dt
+        # приращения (dt=1); скорость λ учитывает L_GAIN
+        d_om = np.diff(om)
+        d_la_raw = np.diff(la)
+        d_la = self.p.L_GAIN * d_la_raw
 
-        om[t] = Omega
-        la[t] = Lambda
-        d_om[t] = dOmega
-        d_la[t] = dLambda
+        mean_abs_dla = float(np.mean(np.abs(d_la))) if d_la.size else 0.0
+        corr = safe_corrcoef(d_om, d_la) if d_om.size and d_la.size else 0.0
+        varw = rolling_var(om, self.p.VAR_WINDOW)
 
-        # расчёт rolling var Ω′
-        if t+1 >= win:
-            var_om_win = np.var(om[t-win+1:t+1])
+        # доли режимов
+        if self.regimes:
+            r = np.asarray(self.regimes)
+            drift_share = float(np.mean(r == 'D') * 100.0)
+            lock_share  = float(np.mean(r == 'L') * 100.0)
+            iterate_share = float(np.mean(r == 'I') * 100.0)
         else:
-            var_om_win = np.nan
-        var_om_roll[t] = var_om_win
+            drift_share = lock_share = iterate_share = 0.0
 
-        # rolling mean |dΛ′/dt|
-        win_buf.append(abs(dLambda))
-        if len(win_buf) > win:
-            win_buf.pop(0)
-        mean_abs_dldt_roll[t] = float(np.mean(win_buf))
+        # переходы режимов
+        transitions = int(np.sum((np.array(self.regimes[1:]) != np.array(self.regimes[:-1])))) if len(self.regimes) > 1 else 0
+        transitions_per_1k = int(round(transitions * 1000.0 / max(1, n_steps)))
 
-        # классификация режима по текущим "окнам"
-        vw = var_om_win if not np.isnan(var_om_win) else 0.0
-        mabs = mean_abs_dldt_roll[t]
-        r = classify_regime(vw, mabs, hyst)
-        regime[t] = 0 if r == "Lock" else (1 if r == "Drift" else 2)
+        metrics = {
+            "drift_share": drift_share,
+            "lock_share": lock_share,
+            "iterate_share": iterate_share,
+            "var_win": varw,
+            "mean_abs_dla": mean_abs_dla,
+            "corr": corr,
+            "regime_transitions_per_1k": transitions_per_1k,
+            "anti_stall_bumps": bumps_fired,
+            "last_bump_t": last_bump_t,
+        }
 
-        # анти-стоп: очень долгое "тихое" окно
-        if (t > win*2) and (vw < 1e-8) and (mabs < 1e-4):
-            Omega += 0.02*np.sign(np.random.randn())
-            Lambda += 0.02*np.sign(np.random.randn())
-            bumps_fired += 1
-            last_bump_t = t
+        traces = {
+            "omega_p": om,
+            "lambda_p": la,
+            "d_om": d_om,
+            "d_la": d_la,
+            "regimes": self.regimes,
+        }
 
-    # метрики
-    # финальные окна (если NaN — берём последнее не-NaN)
-    valid = ~np.isnan(var_om_roll)
-    var_win_val = float(var_om_roll[valid][-1] if np.any(valid) else 0.0)
-    mean_abs_dldt = float(mean_abs_dldt_roll[-1])
-
-    # корреляция производных
-    try:
-        corr = float(np.corrcoef(d_om, d_la)[0,1])
-        if math.isnan(corr):
-            corr = 0.0
-    except Exception:
-        corr = 0.0
-
-    # доли режимов
-    lock_share = 100.0 * np.mean(regime == 0)
-    drift_share = 100.0 * np.mean(regime == 1)
-    iterate_share = 100.0 * np.mean(regime == 2)
-
-    # число переключений режимов
-    transitions = int(np.sum(np.diff(regime) != 0))
-    transitions_per_1k = transitions / (steps/1000.0)
-
-    # вердикт
-    pass_var = (ALIVE_VAR_MIN < var_win_val < ALIVE_VAR_MAX)
-    pass_mean = (mean_abs_dldt > ALIVE_MEAN_DLDL_MIN)
-    pass_drift = (drift_share >= ALIVE_DRIFT_MIN)
-    alive = pass_var and pass_mean and pass_drift
-    verdict = "[ALIVE]" if alive else "[NOT ALIVE]"
-
-    # подготовим текст отчёта
-    lines = []
-    lines.append("===== ACE REPORT v0.4e-fix =====")
-    lines.append(f"Drift share:          {fmt(drift_share,2)} %")
-    lines.append(f"Lock share:           {fmt(lock_share,2)} %")
-    lines.append(f"Iterate share:        {fmt(iterate_share,2)} %\n")
-    lines.append(f"var_win(Ω′):          {fmt(var_win_val)}")
-    lines.append(f"mean |dΛ′/dt|:        {fmt(mean_abs_dldt)}")
-    lines.append(f"Corr(dΩ′, dΛ′):       {fmt(corr,3)}\n")
-    lines.append(f"Regime transitions /1k steps: {transitions_per_1k:.0f}\n")
-    lines.append("Alive rule:")
-    lines.append(f"  var_win(Ω′) in (1e-6 .. 1e-3):   [{'OK' if pass_var else 'FAIL'}]")
-    lines.append(f"  mean |dΛ′/dt| > 1e-2:            [{'OK' if pass_mean else 'FAIL'}]")
-    lines.append(f"  Drift share ≥ 20%:               [{'OK' if pass_drift else 'FAIL'}]\n")
-    lines.append(f"VERDICT: {verdict}\n")
-    lines.append("Notes:")
-    lines.append(f"- anti-stall bumps: {bumps_fired} fired")
-    lines.append(f"- last bump at t = {last_bump_t}")
-    lines.append(f"- params: COUP_LA_TO_OM={params['COUP_LA_TO_OM']}, "
-                 f"COUP_OM_TO_LA={params['COUP_OM_TO_LA']}, MEM_DECAY={params['MEM_DECAY']}, "
-                 f"HYST={params['HYST']}, NOISE={params['NOISE']}")
-    lines.append("================================\n")
-    report_text = "\n".join(lines)
-
-    # сохранить CSV с историей (минимально)
-    os.makedirs(OUT_DIR, exist_ok=True)
-    csv_path = os.path.join(OUT_DIR, "data.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["t","Omega","Lambda","dOmega","dLambda","regime","var_win","mean_abs_dldt"])
-        for t in range(steps):
-            w.writerow([t, om[t], la[t], d_om[t], d_la[t], int(regime[t]),
-                        0.0 if np.isnan(var_om_roll[t]) else var_om_roll[t],
-                        mean_abs_dldt_roll[t]])
-
-    save_report_text(report_text)
-
-    metrics = Metrics(
-        drift_share=drift_share,
-        lock_share=lock_share,
-        iterate_share=iterate_share,
-        var_win=var_win_val,
-        mean_abs_dldt=mean_abs_dldt,
-        corr_d_om_d_la=corr,
-        transitions_per_1k=transitions_per_1k,
-        bumps_fired=bumps_fired,
-        last_bump_t=last_bump_t
-    )
-
-    return verdict, metrics, {
-        "Omega": om, "Lambda": la, "dOmega": d_om, "dLambda": d_la,
-        "regime": regime, "var_roll": var_om_roll, "mean_abs_dldt_roll": mean_abs_dldt_roll
-    }
-
-# ---------------------------
-# АВТО-ПОДБОР ДО [ALIVE]
-# ---------------------------
-
-def autotune_until_alive(base_params: Dict[str,float]) -> Dict[str,float]:
-    """
-    Перебирает небольшую, но «умную» сетку вокруг рабочих значений.
-    Останавливается на первом найденном [ALIVE], сохраняет best_params.json.
-    """
-    # сетка компактная, чтобы не гонять сотни прогонов впустую
-    grid = {
-        "COUP_LA_TO_OM": [round(base_params["COUP_LA_TO_OM"] + d, 2) for d in (-0.03, -0.01, 0.0, +0.01, +0.03)],
-        "COUP_OM_TO_LA": [round(base_params["COUP_OM_TO_LA"] + d, 2) for d in (-0.06, -0.03, 0.0, +0.03, +0.06)],
-        "MEM_DECAY":     [round(x,2) for x in np.clip(
-                             np.array([base_params["MEM_DECAY"] + d for d in (-0.12,-0.08,-0.04,0.0,+0.04,+0.08,+0.12)]),
-                             0.05, 0.8)],
-        "HYST":          [round(x,3) for x in np.clip(
-                             np.array([base_params["HYST"] + d for d in (-0.003,-0.002,-0.001,0.0,+0.001,+0.002)]),
-                             0.002, 0.02)],
-        "NOISE":         [round(x,3) for x in np.clip(
-                             np.array([base_params["NOISE"] + d for d in (-0.005,-0.003,-0.002,0.0,+0.002,+0.003)]),
-                             0.003, 0.05)],
-    }
-
-    tried = 0
-    best = None
-    best_score = -1e9
-
-    from itertools import product
-    for c1, c2, md, hy, nz in product(
-        grid["COUP_LA_TO_OM"], grid["COUP_OM_TO_LA"],
-        grid["MEM_DECAY"], grid["HYST"], grid["NOISE"]
-    ):
-        tried += 1
-        params = base_params.copy()
-        params.update({"COUP_LA_TO_OM": c1, "COUP_OM_TO_LA": c2,
-                       "MEM_DECAY": md, "HYST": hy, "NOISE": nz})
-        verdict, m, _ = run_simulation(params, steps=STEPS)
-
-        pass_var  = (ALIVE_VAR_MIN < m.var_win < ALIVE_VAR_MAX)
-        pass_mean = (m.mean_abs_dldt > ALIVE_MEAN_DLDL_MIN)
-        pass_drift= (m.drift_share >= ALIVE_DRIFT_MIN)
-
-        if pass_var and pass_mean and pass_drift:
-            # нашли живое — зафиксировали и выходим
-            with open("best_params.json","w",encoding="utf-8") as f:
-                json.dump(params, f, indent=2)
-            print("\n✅ ALIVE FOUND")
-            print(json.dumps(params, indent=2))
-            print(f"Metrics: var={m.var_win:.3e}, mean|dΛ′/dt|={m.mean_abs_dldt:.5f}, drift={m.drift_share:.2f}%")
-            return params
-
-        # иначе — накапливаем лучший «почти живой»
-        # скоринг: по выполненным условиям + близость var к центру и величина mean
-        score = 0.0
-        score += 1.0 if pass_var else -abs(math.log10(max(m.var_win,1e-12)) - math.log10(5e-5))
-        score += 1.0 if pass_mean else (m.mean_abs_dldt / ALIVE_MEAN_DLDL_MIN)
-        score += 1.0 if pass_drift else (m.drift_share / ALIVE_DRIFT_MIN)
-
-        if score > best_score:
-            best_score = score
-            best = (params, m)
-
-        # небольшая печать прогресса
-        if tried % 25 == 0:
-            print(f"... tried {tried} combos; best so far: "
-                  f"var={best[1].var_win:.2e}, mean={best[1].mean_abs_dldt:.5f}, drift={best[1].drift_share:.1f}%")
-
-    # ничего живого не нашли — оставим лучший кандидат, но предупредим
-    if best:
-        params, m = best
-        with open("best_params.json","w",encoding="utf-8") as f:
-            json.dump(params, f, indent=2)
-        print("\n❌ ALIVE not found within grid. Best candidate saved to best_params.json:")
-        print(json.dumps(params, indent=2))
-        print(f"Metrics: var={m.var_win:.3e}, mean|dΛ′/dt|={m.mean_abs_dldt:.5f}, drift={m.drift_share:.2f}%")
-        return params
-    else:
-        print("\n❌ ALIVE not found and no best candidate (unexpected). Using base params.")
-        return base_params
-
-# ---------------------------
-# Точка входа
-# ---------------------------
-
-def main():
-    params = load_params()
-    if "--tune" in sys.argv:
-        print(">>> AUTOTUNE mode: searching for [ALIVE] configuration ...")
-        params = autotune_until_alive(params)
-        # финальный подтверждающий прогон
-        verdict, m, _ = run_simulation(params, steps=STEPS)
-        print(f"\nFinal verdict after autotune: {verdict}")
-        print(f"var={m.var_win:.3e}, mean|dΛ′/dt|={m.mean_abs_dldt:.5f}, drift={m.drift_share:.2f}%")
-    else:
-        verdict, m, _ = run_simulation(params, steps=STEPS)
-        print(open("last_report.txt","r",encoding="utf-8").read())
-
-if __name__ == "__main__":
-    main()
+        return {"metrics": metrics, "traces": traces}

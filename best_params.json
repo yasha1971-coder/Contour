@@ -1,0 +1,17 @@
+{
+  "COUP_LA_TO_OM": 0.18,
+  "COUP_OM_TO_LA": 0.20,
+  "MEM_DECAY": 0.38,
+  "HYST": 0.0065,
+  "NOISE": 0.012,
+  "VAR_WINDOW": 300,
+  "DRIFT_HYST": 0.022,
+  "ANTI_STALL_BUMP": 0.012,
+  "L_GAIN": 1.3,
+
+  "USE_NUDGES": false,
+  "USE_ENV_ADAPTER": false,
+  "NUDGE_GAIN": 0.0,
+  "ENV_GAIN": 0.0,
+  "ENTROPY_WINDOW": 50
+}

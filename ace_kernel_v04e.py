@@ -1,317 +1,287 @@
 # ace_kernel_v04e.py
-# ACE v0.4e — минимальное ядро с двумя хуками и nudges до интеграции шага
+# ACE Engine v0.4e-fix — безопасное ядро с хуками, клиппингом и анти-NaN
+# Совместимо с прежними отчётами: summary.txt, data.csv
+# Автор: ACE (Autonomous Contour Engine)
 
 from __future__ import annotations
+import json, math, csv, os, time
 from dataclasses import dataclass, asdict
-from collections import deque
-from typing import Callable, Dict, Optional, Any, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
-import math
-import os
 
-# ---------------------------
-# Параметры и состояние
-# ---------------------------
+# ---------- Константы безопасности ----------
+EPS = 1e-12
+CAP = 1e9
+OMEGA_CAP = 1e6
+LAMBDA_CAP = 1e6
 
+# ---------- Утилиты безопасности ----------
+def sanitize(x: float) -> float:
+    return float(np.nan_to_num(x, nan=0.0, posinf=CAP, neginf=-CAP))
+
+def safe_var(x: np.ndarray) -> float:
+    if x.size < 2: return 0.0
+    if np.allclose(x, x[0]): return 0.0
+    v = float(np.var(x))
+    if not np.isfinite(v): return 0.0
+    return v
+
+def safe_mean_abs(x: np.ndarray) -> float:
+    if x.size == 0: return 0.0
+    m = float(np.mean(np.abs(x)))
+    if not np.isfinite(m): return 0.0
+    return m
+
+def safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+    n = min(a.size, b.size)
+    if n < 2: return 0.0
+    a = a[-n:]; b = b[-n:]
+    sa, sb = np.std(a), np.std(b)
+    if sa < EPS or sb < EPS: return 0.0
+    c = float(np.corrcoef(a, b)[0, 1])
+    if not np.isfinite(c): return 0.0
+    return c
+
+def clip_params(p: Dict[str, float]) -> Dict[str, float]:
+    """Жёсткий клиппинг допустимых диапазонов."""
+    p = dict(p)
+    p["NOISE"] = float(np.clip(p.get("NOISE", 0.012), 0.008, 0.020))
+    p["MEM_DECAY"] = float(np.clip(p.get("MEM_DECAY", 0.38), 0.20, 0.45))
+    p["HYST"] = float(np.clip(p.get("HYST", 0.0065), 0.004, 0.010))
+    p["L_GAIN"] = float(np.clip(p.get("L_GAIN", 1.30), 1.10, 1.50))
+    p["COUP_LA_TO_OM"] = float(np.clip(p.get("COUP_LA_TO_OM", 0.20), 0.15, 0.30))
+    p["COUP_OM_TO_LA"] = float(np.clip(p.get("COUP_OM_TO_LA", 0.20), 0.15, 0.30))
+    return p
+
+def trajectory_guard(omega: float, lam: float) -> bool:
+    """Ранний стоп: NaN/Inf/вылет по амплитуде."""
+    if not (np.isfinite(omega) and np.isfinite(lam)): return False
+    if abs(omega) > OMEGA_CAP or abs(lam) > LAMBDA_CAP: return False
+    return True
+
+# ---------- Структуры данных ----------
 @dataclass
 class ACEParams:
-    COUP_LA_TO_OM: float = 0.18   # λ → ω
-    COUP_OM_TO_LA: float = 0.20   # ω → λ
-    MEM_DECAY: float    = 0.38
-    HYST: float         = 0.0065
-    NOISE: float        = 0.012
-    L_GAIN: float       = 1.3
-    VAR_WINDOW: int     = 300
+    NOISE: float = 0.012
+    MEM_DECAY: float = 0.38
+    HYST: float = 0.0065
+    L_GAIN: float = 1.30
+    COUP_LA_TO_OM: float = 0.20
+    COUP_OM_TO_LA: float = 0.20
 
-    # границы безопасности
-    NOISE_MIN: float = 0.006
-    NOISE_MAX: float = 0.020
-    MEM_MIN:   float = 0.30
-    MEM_MAX:   float = 0.45
+    @classmethod
+    def from_json(cls, path: str) -> "ACEParams":
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        else:
+            d = {}
+        d = clip_params(d)
+        return cls(**d)
 
+    def to_json(self, path: str):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(clip_params(asdict(self)), f, ensure_ascii=False, indent=2)
+
+# ---------- Хуки (до/после шага) ----------
+PreStepHook = Callable[[int, "ACEState", ACEParams], None]
+PostStepHook = Callable[[int, "ACEState", ACEParams], None]
+
+# ---------- Состояние ----------
 @dataclass
 class ACEState:
     t: int = 0
-    omega: float = 0.0   # Ω′
-    lam: float = 0.0     # Λ′
-    last_omega: float = 0.0
-    last_lam: float = 0.0
+    omega: float = 0.0     # Ω′
+    lam: float = 0.0       # Λ′
+    d_omega_hist: List[float] = None
+    d_lambda_hist: List[float] = None
+    regime_hist: List[int] = None  # 0: drift, 1: lock, 2: iterate
 
-# ---------------------------
-# Вспомогательные функции
-# ---------------------------
+    def __post_init__(self):
+        if self.d_omega_hist is None: self.d_omega_hist = []
+        if self.d_lambda_hist is None: self.d_lambda_hist = []
+        if self.regime_hist is None: self.regime_hist = []
 
-def clip(x: float, lo: float, hi: float) -> float:
-    return lo if x < lo else hi if x > hi else x
-
-def safe_corr(a: np.ndarray, b: np.ndarray) -> float:
-    if len(a) < 3 or np.all(a == a[0]) or np.all(b == b[0]):
-        return 0.0
-    try:
-        c = np.corrcoef(a, b)[0, 1]
-        if math.isnan(c):
-            return 0.0
-        return float(c)
-    except Exception:
-        return 0.0
-
-# ---------------------------
-# Ядро ACE
-# ---------------------------
-
+# ---------- Ядро ACE ----------
 class ACEEngineV04e:
-    """
-    Мини-ядро ACE со сценарием self-goal v0.5:
-    - два хука:
-        * on_pre_integrate(engine, state, metrics, nudges) -> Optional[dict]
-        * on_post_step(engine, state, metrics) -> None
-    - nudges (коррекции NOISE/MEM_DECAY) рассчитываются и ПРИМЕНЯЮТСЯ
-      ДО интеграции шага (до обновления Ω′/Λ′).
-    """
+    def __init__(self,
+                 params: ACEParams,
+                 var_window: int = 300,
+                 report_dir: str = "ace_v04e_report"):
+        self.params = params
+        self.var_window = max(20, int(var_window))
+        self.report_dir = report_dir
+        os.makedirs(self.report_dir, exist_ok=True)
 
-    def __init__(
-        self,
-        params: Optional[ACEParams] = None,
-        seed: int = 42,
-        hooks: Optional[Dict[str, Callable[..., Any]]] = None,
-    ):
-        self.params = params or ACEParams()
-        self.state = ACEState()
-        self.rng = np.random.default_rng(seed)
+        # Хуки
+        self.pre_step_hooks: List[PreStepHook] = []
+        self.post_step_hooks: List[PostStepHook] = []
 
-        # истории для метрик
-        w = max(10, int(self.params.VAR_WINDOW))
-        self.omega_hist = deque(maxlen=w)
-        self.lam_hist = deque(maxlen=w)
-        self.domega_hist = deque(maxlen=w)
-        self.dlam_hist = deque(maxlen=w)
+        # «Толчки» (nudges) перед интеграцией, если сигнал залипает
+        self.nudge_eps = 1e-6
+        self.nudge_gain = 0.001
 
-        # хуки (no-op по умолчанию)
-        self.hooks: Dict[str, Callable[..., Any]] = {
-            "on_pre_integrate": lambda *args, **kwargs: None,
-            "on_post_step": lambda *args, **kwargs: None,
-        }
-        if hooks:
-            self.hooks.update(hooks)
+    # ---- API: регистрация хуков ----
+    def add_pre_step_hook(self, fn: PreStepHook):
+        self.pre_step_hooks.append(fn)
 
-        # доли режимов (грубая оценка)
-        self.regime_counts = {"drift": 0, "lock": 0, "iterate": 0}
+    def add_post_step_hook(self, fn: PostStepHook):
+        self.post_step_hooks.append(fn)
 
-    # ---------- публичный API ----------
-    def set_hook(self, name: str, fn: Callable[..., Any]) -> None:
-        if name not in self.hooks:
-            raise KeyError(f"Unknown hook: {name}")
-        self.hooks[name] = fn
+    # ---- Один шаг динамики ----
+    def step(self, st: ACEState):
+        p = self.params = ACEParams(**clip_params(asdict(self.params)))
 
-    def get_params(self) -> dict:
-        return asdict(self.params)
+        # nudges если производные долго нулевые
+        if st.d_omega_hist[-5:].count(0.0) == 5 if len(st.d_omega_hist) >= 5 else False:
+            st.omega += self.nudge_gain
+        if st.d_lambda_hist[-5:].count(0.0) == 5 if len(st.d_lambda_hist) >= 5 else False:
+            st.lam += self.nudge_gain
 
-    def step(self) -> Dict[str, float]:
-        """
-        Один шаг симуляции:
-          1) измеряем метрики
-          2) вычисляем nudges (self-goal v0.5)
-          3) ВЫЗЫВАЕМ on_pre_integrate и применяем nudges к параметрам
-          4) интегрируем динамику Ω′/Λ′
-          5) ВЫЗЫВАЕМ on_post_step
-        """
-        metrics = self._measure_metrics()
+        # --- PRE hooks ---
+        for h in self.pre_step_hooks:
+            try: h(st.t, st, p)
+            except Exception: pass
 
-        # (2) — self-goal loop v0.5 → nudges
-        nudges = self._compute_nudges(metrics)
+        # --- интеграция (упрощённая устойчивая схема) ---
+        # базовый шум (NOISE) + перекрёстные связи
+        eta_o = np.random.normal(0.0, p.NOISE)
+        eta_l = np.random.normal(0.0, p.NOISE)
 
-        # (3) — ХУК ПЕРЕД ИНТЕГРАЦИЕЙ: дать внешнему коду скорректировать nudges/состояние
-        try:
-            hook_delta = self.hooks["on_pre_integrate"](self, self.state, metrics, dict(nudges))
-            if isinstance(hook_delta, dict):
-                nudges.update(hook_delta)
-        except Exception as e:
-            # Хук не должен ломать симуляцию
-            print(f"[hook:on_pre_integrate] error: {e}")
+        d_omega = -p.HYST * st.omega + p.COUP_LA_TO_OM * st.lam + eta_o
+        d_lambda = -p.MEM_DECAY * st.lam + p.COUP_OM_TO_LA * st.omega + p.L_GAIN * np.tanh(st.omega) + eta_l
 
-        # применяем nudges к параметрам ДО интеграции шага
-        self._apply_nudges(nudges)
+        # Эйлер с санитацией
+        st.omega = sanitize(st.omega + d_omega)
+        st.lam   = sanitize(st.lam   + d_lambda)
 
-        # (4) — интеграция шага (минимальная, стабильная)
-        self._integrate()
+        # Страж траектории
+        if not trajectory_guard(st.omega, st.lam):
+            raise FloatingPointError("Unstable trajectory (guard tripped)")
 
-        # обновляем истории
-        self._push_histories()
+        # Режим (примерная эвристика)
+        regime = 0  # drift
+        if abs(d_omega) < 0.5 * p.NOISE and abs(d_lambda) < 0.5 * p.NOISE:
+            regime = 1  # lock (затухание)
+        elif abs(d_omega) > 5 * p.NOISE or abs(d_lambda) > 5 * p.NOISE:
+            regime = 2  # iterate (бурные колебания)
 
-        # финальные метрики после шага (по желанию можно вернуть pre или post)
-        post_metrics = self._measure_metrics()
+        st.d_omega_hist.append(float(d_omega))
+        st.d_lambda_hist.append(float(d_lambda))
+        st.regime_hist.append(regime)
+        st.t += 1
 
-        # (5) — ХУК ПОСЛЕ ШАГА
-        try:
-            self.hooks["on_post_step"](self, self.state, dict(post_metrics))
-        except Exception as e:
-            print(f"[hook:on_post_step] error: {e}")
+        # --- POST hooks ---
+        for h in self.post_step_hooks:
+            try: h(st.t, st, p)
+            except Exception: pass
 
-        return post_metrics
-
-    def run(self, steps: int) -> Dict[str, float]:
-        m = {}
+    # ---- Основной прогон ----
+    def run(self, steps: int = 4000) -> Dict[str, float]:
+        st = ACEState()
+        var_series: List[float] = []
         for _ in range(steps):
-            m = self.step()
-        return m
+            try:
+                self.step(st)
+            except FloatingPointError:
+                # аварийный выход: нестабильная комбинация
+                break
+            # скользящее окно для var_win(Ω′)
+            var_series.append(st.omega)
+            if len(var_series) > self.var_window:
+                var_series.pop(0)
 
-    # ---------- внутренняя механика ----------
-    def _integrate(self) -> None:
-        """Простая устойчивая динамика Ω′/Λ′ за один шаг."""
-        p = self.params
-        s = self.state
+        # Метрики
+        var_win = safe_var(np.array(var_series))
+        mean_dlambda = safe_mean_abs(np.array(st.d_lambda_hist))
+        corr = safe_corr(np.array(st.d_omega_hist[-self.var_window:]),
+                         np.array(st.d_lambda_hist[-self.var_window:]))
 
-        # шум
-        eta = float(self.rng.normal(0.0, 1.0))
-        xi = float(self.rng.normal(0.0, 1.0))
-        noise_term = p.NOISE * eta
+        regimes = np.array(st.regime_hist, dtype=int) if st.regime_hist else np.array([0], dtype=int)
+        N = max(1, regimes.size)
+        drift_share = float(np.sum(regimes == 0)) / N * 100.0
+        lock_share  = float(np.sum(regimes == 1)) / N * 100.0
+        iterate_share = float(np.sum(regimes == 2)) / N * 100.0
 
-        # dΩ′ и dΛ′ (минимальная, но не тривиальная связь)
-        d_omega = -p.HYST * s.omega + p.COUP_LA_TO_OM * s.lam + noise_term
-        d_lam = -p.MEM_DECAY * s.lam + p.L_GAIN * (s.omega + 0.25 * xi)
+        # Переходы режимов на 1k шагов
+        trans = int(np.sum(regimes[1:] != regimes[:-1]))
+        trans_per_1k = int(round(1000.0 * trans / max(1, N)))
 
-        s.last_omega = s.omega
-        s.last_lam = s.lam
+        alive_var = (1e-6 <= var_win <= 1e-3)
+        alive_vel = (mean_dlambda >= 1e-2)
+        alive_drift = (drift_share >= 20.0)
+        verdict = "ALIVE" if (alive_var and alive_vel and alive_drift) else "NOT ALIVE"
 
-        # шаг интеграции (dt=1)
-        s.omega += d_omega
-        s.lam += d_lam
-        s.t += 1
-
-        # запись приращений
-        self.domega_hist.append(d_omega)
-        self.dlam_hist.append(d_lam)
-
-        # обновление режима (грубая классификация)
-        if abs(d_omega) + abs(d_lam) < 1e-4:
-            self.regime_counts["lock"] += 1
-        elif np.sign(d_omega) == np.sign(d_lam):
-            self.regime_counts["drift"] += 1
-        else:
-            self.regime_counts["iterate"] += 1
-
-    def _push_histories(self) -> None:
-        self.omega_hist.append(self.state.omega)
-        self.lam_hist.append(self.state.lam)
-
-    def _measure_metrics(self) -> Dict[str, float]:
-        w = max(3, len(self.omega_hist))
-        if w < 3:
-            # прогрев
-            return {
-                "var_win_omega": 0.0,
-                "mean_abs_dlambda": 0.0,
-                "corr_domega_dlambda": 0.0,
-                "drift_share": 0.0,
-                "lock_share": 0.0,
-                "iterate_share": 0.0,
-                "regime_transitions_per_1k": 0.0,
-            }
-
-        omega_arr = np.array(self.omega_hist, dtype=float)
-        var_win = float(np.var(omega_arr, ddof=0))
-
-        dω = np.array(self.domega_hist, dtype=float)
-        dλ = np.array(self.dlam_hist, dtype=float)
-        mean_abs_dlambda = float(np.mean(np.abs(dλ))) if len(dλ) else 0.0
-        corr = safe_corr(dω[-w:], dλ[-w:])
-
-        total = sum(self.regime_counts.values()) or 1
-        drift_share = 100.0 * self.regime_counts["drift"] / total
-        lock_share = 100.0 * self.regime_counts["lock"] / total
-        iterate_share = 100.0 * self.regime_counts["iterate"] / total
-
-        reg_transitions_per_1k = float(total) * (1000.0 / max(1, self.state.t))
-
-        return {
-            "var_win_omega": var_win,
-            "mean_abs_dlambda": mean_abs_dlambda,
+        metrics = {
+            "Drift share": drift_share,
+            "Lock share": lock_share,
+            "Iterate share": iterate_share,
+            "var_win": var_win,
+            "mean_abs_dlambda_dt": mean_dlambda,
             "corr_domega_dlambda": corr,
-            "drift_share": drift_share,
-            "lock_share": lock_share,
-            "iterate_share": iterate_share,
-            "regime_transitions_per_1k": reg_transitions_per_1k,
+            "regime_transitions_per_1k": trans_per_1k,
+            "verdict": verdict,
         }
 
-    # --- self-goal loop v0.5: вычисление nudges ---
-    def _compute_nudges(self, metrics: Dict[str, float]) -> Dict[str, float]:
-        """
-        Возвращает предложенные изменения параметров ДО интеграции шага.
-        Цель: держать var_win(Ω′) в окне [1e-6 .. 1e-3] и mean|dΛ′/dt| ≥ 1e-2.
-        """
-        var_min, var_max = 1e-6, 1e-3
-        target_mean = 1e-2
+        self._save_report(metrics, st)
+        return metrics
 
-        var_win = metrics["var_win_omega"]
-        v_err_low = max(0.0, var_min - var_win)
-        v_err_high = max(0.0, var_win - var_max)
+    # ---- Сохранение отчёта ----
+    def _save_report(self, metrics: Dict[str, float], st: ACEState):
+        # summary.txt
+        lines = []
+        lines.append("===== ACE REPORT v0.4e-fix =====")
+        lines.append(f"Drift share:          {metrics['Drift share']:.2f} %")
+        lines.append(f"Lock share:           {metrics['Lock share']:.2f} %")
+        lines.append(f"Iterate share:        {metrics['Iterate share']:.2f} %\n")
+        lines.append(f"var_win(Ω′):          {metrics['var_win']:.9e}")
+        lines.append(f"mean |dΛ′/dt|:        {metrics['mean_abs_dlambda_dt']:.5f}")
+        lines.append(f"Corr(dΩ′, dΛ′):       {metrics['corr_domega_dlambda']:+.3f}\n")
+        lines.append(f"Regime transitions /1k steps: {metrics['regime_transitions_per_1k']}\n")
+        lines.append("Alive rule:")
+        lines.append(f"  var_win(Ω′) in (1e-6 .. 1e-3):   [{'OK' if 1e-6 <= metrics['var_win'] <= 1e-3 else 'FAIL'}]")
+        lines.append(f"  mean |dΛ′/dt| > 1e-2:            [{'OK' if metrics['mean_abs_dlambda_dt'] >= 1e-2 else 'FAIL'}]")
+        lines.append(f"  Drift share ≥ 20%:               [{'OK' if metrics['Drift share'] >= 20.0 else 'FAIL'}]\n")
+        lines.append(f"VERDICT: [{metrics['verdict']}]\n")
+        lines.append("Notes:")
+        p = asdict(self.params)
+        lines.append(f"- params: COUP_LA_TO_OM={p['COUP_LA_TO_OM']}, COUP_OM_TO_LA={p['COUP_OM_TO_LA']}, "
+                     f"MEM_DECAY={p['MEM_DECAY']}, HYST={p['HYST']}, NOISE={p['NOISE']}, L_GAIN={p['L_GAIN']}")
+        lines.append("================================\n")
 
-        mean_abs_dlambda = metrics["mean_abs_dlambda"]
-        need_more_breath = mean_abs_dlambda < target_mean
+        with open(os.path.join(self.report_dir, "summary.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
 
-        nudges = {"dNOISE": 0.0, "dMEM": 0.0, "reason": []}
+        # data.csv (дельты)
+        csv_path = os.path.join(self.report_dir, "data.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["t", "dOmega", "dLambda"])
+            for i, (do, dl) in enumerate(zip(
+                np.array(st.d_omega_hist, dtype=float),
+                np.array(st.d_lambda_hist, dtype=float))):
+                w.writerow([i, sanitize(do), sanitize(dl)])
 
-        # Если дисперсия слишком высокая → чуть зажать памятью
-        if v_err_high > 0:
-            k = 0.10  # мягко
-            nudges["dMEM"] += k * (v_err_high / var_max)
-            nudges["reason"].append("var_high→MEM+")
-            # и немного уменьшить шум
-            nudges["dNOISE"] -= 0.10 * (v_err_high / var_max)
-
-        # Если дисперсия слишком низкая → немного отпустить память и дать шуму
-        if v_err_low > 0:
-            k = 0.08
-            nudges["dMEM"] -= k * (v_err_low / var_min)
-            nudges["dNOISE"] += 0.08 * (v_err_low / var_min)
-            nudges["reason"].append("var_low→MEM- NOISE+")
-
-        # Если «дыхание» слабое → дополнительно стимулируем шум
-        if need_more_breath:
-            nudges["dNOISE"] += 0.003
-            nudges["reason"].append("breath_low→NOISE+")
-
-        # Лёгкая нормализация: не позволяем чрезмерных шагов
-        nudges["dNOISE"] = clip(nudges["dNOISE"], -0.004, +0.004)
-        nudges["dMEM"] = clip(nudges["dMEM"], -0.04, +0.04)
-
-        return nudges
-
-    def _apply_nudges(self, nudges: Dict[str, float]) -> None:
-        p = self.params
-        if "dNOISE" in nudges:
-            p.NOISE = clip(p.NOISE + float(nudges["dNOISE"]), p.NOISE_MIN, p.NOISE_MAX)
-        if "dMEM" in nudges:
-            p.MEM_DECAY = clip(p.MEM_DECAY + float(nudges["dMEM"]), p.MEM_MIN, p.MEM_MAX)
-
-# ---------------------------
-# Быстрый стенд
-# ---------------------------
-
-def quick_run(steps: int = 4000, seed: int = 42, hooks: Optional[Dict[str, Callable[..., Any]]] = None) -> Tuple[ACEEngineV04e, Dict[str, float]]:
-    eng = ACEEngineV04e(ACEParams(), seed=seed, hooks=hooks)
-    # прогрев истории (нулевые значения)
-    for _ in range(eng.params.VAR_WINDOW // 2):
-        eng._push_histories()
-        eng.domega_hist.append(0.0)
-        eng.dlam_hist.append(0.0)
-    metrics = eng.run(steps)
-    return eng, metrics
+# ---- Утилита: быстрый запуск ----
+def run_once(best_params_path: str = "best_params.json",
+             steps: int = 4000,
+             var_window: int = 300,
+             report_dir: str = "ace_v04e_report") -> Dict[str, float]:
+    params = ACEParams.from_json(best_params_path)
+    eng = ACEEngineV04e(params, var_window=var_window, report_dir=report_dir)
+    return eng.run(steps=steps)
 
 if __name__ == "__main__":
-    # пример пользовательского хука:
-    def pre_integrate(engine: ACEEngineV04e, state: ACEState, metrics: Dict[str, float], nudges: Dict[str, float]):
-        # пример: мягкий приоритет «живого дыхания» — если mean|dΛ′/dt| низок, усиливаем шум сильнее
-        if metrics.get("mean_abs_dlambda", 0.0) < 1e-2:
-            nudges["dNOISE"] = clip(nudges.get("dNOISE", 0.0) + 0.001, -0.004, 0.004)
-        return nudges  # можно вернуть изменённые nudges
-
-    def post_step(engine: ACEEngineV04e, state: ACEState, metrics: Dict[str, float]):
-        # лог каждые 1000 шагов (как пример использования)
-        if state.t % 1000 == 0:
-            print(f"[t={state.t}] var={metrics['var_win_omega']:.3e} "
-                  f"mean|dΛ′/dt|={metrics['mean_abs_dlambda']:.5f} "
-                  f"NOISE={engine.params.NOISE:.4f} MEM={engine.params.MEM_DECAY:.3f}")
-
-    engine, m = quick_run(hooks={"on_pre_integrate": pre_integrate, "on_post_step": post_step})
-    print("Final:", m)
+    # Простой CLI
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--steps", type=int, default=4000)
+    ap.add_argument("--var_window", type=int, default=300)
+    ap.add_argument("--params", type=str, default="best_params.json")
+    ap.add_argument("--report_dir", type=str, default="ace_v04e_report")
+    args = ap.parse_args()
+    m = run_once(best_params_path=args.params,
+                 steps=args.steps,
+                 var_window=args.var_window,
+                 report_dir=args.report_dir)
+    print(json.dumps(m, ensure_ascii=False, indent=2))
